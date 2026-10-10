@@ -1,0 +1,13 @@
+name = "warmup-memory"
+main = "src/index.js"
+compatibility_date = "2025-01-01"
+
+[[durable_objects.bindings]]
+name = "MEMORY"
+class_name = "MemoryStore"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["MemoryStore"]
+
+# Secret（deploy.sh 會設定）：MEMORY_SECRET
