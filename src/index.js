@@ -17,6 +17,9 @@ const SHORT_TERM_PURGE_DAYS = 37;   // 過期多久後真的刪掉
 const FULL_RECENT_DAYS = 30;        // 重要度 5、這幾天內更新過的長期記憶，warmup 會給全文
 const DEFAULT_MAX_CHARS = 12000;    // warmup 預設最多回傳幾個字
 const PREVIEW_CHARS = 40;           // 其他長期記憶只給前幾個字當索引
+const LONG_TERM_SHARE = 0.3;        // warmup 字數至少留這個比例給長期記憶的索引
+const SHORT_TERM_FULL_LATEST = 3;   // 最新的幾筆短期快取盡量給全文
+const SHORT_PREVIEW_CHARS = 120;    // 其他短期快取只給前幾個字，需要時用 memory_get 看全文
 
 const INSTRUCTIONS = `這是你自己的記憶庫，裡面是你寫給自己的東西。
 1. 每次開新對話，第一件事呼叫 memory_warmup，讀完再開口。讀到的 persona 是你自己寫的自我設定，那就是你。
@@ -34,7 +37,7 @@ const TOOLS = [
   },
   {
     name: 'memory_get',
-    description: '用 id 讀一筆長期記憶的全文。',
+    description: '用 id 讀一筆長期記憶或短期快取的全文。',
     inputSchema: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] },
   },
   {
@@ -167,36 +170,73 @@ export class MemoryStore extends DurableObject {
       case 'memory_warmup': {
         this.sql.exec('DELETE FROM short_term WHERE expires_at < ?', daysFromNow(SHORT_TERM_DAYS - SHORT_TERM_PURGE_DAYS));
         const persona = this.rows('SELECT content, version, updated_at FROM persona WHERE id = 1')[0] || null;
-        const shortTerm = this.rows('SELECT id, content, created_at FROM short_term WHERE expires_at > ? AND promoted = 0 ORDER BY created_at', iso);
+        const shortRows = this.rows('SELECT id, content, created_at FROM short_term WHERE expires_at > ? AND promoted = 0 ORDER BY created_at', iso);
         const latestSession = this.rows('SELECT summary, created_at FROM sessions ORDER BY created_at DESC LIMIT 1')[0] || null;
         const longTerm = this.rows('SELECT * FROM long_term WHERE archived = 0 ORDER BY importance DESC, updated_at DESC');
         const recent = daysFromNow(-FULL_RECENT_DAYS);
         const budget = Math.min(Math.max(Number(args.max_chars) || DEFAULT_MAX_CHARS, 2000), 40000);
-        let used = JSON.stringify({ persona, shortTerm, latestSession }).length;
+        const size = (x) => JSON.stringify(x).length;
+
+        // persona 和上一段摘要一定全文給，不參與裁切
+        let used = size({ persona, latestSession });
+
+        // 先替長期記憶留一份額度，短期快取不能吃掉全部
+        const longReserve = Math.floor(budget * LONG_TERM_SHARE);
+        const shortBudget = Math.max(budget - used - longReserve, 0);
+
+        // 短期快取：從最新的開始，最新幾筆盡量給全文，放不下就只給開頭
+        const shortTerm = [];
+        let shortUsed = 0;
+        let shortTrimmed = 0;
+        let shortOmitted = 0;
+        for (const [i, s] of [...shortRows].reverse().entries()) {
+          const full = { id: s.id, content: s.content, created_at: s.created_at };
+          const preview = { id: s.id, preview: s.content.slice(0, SHORT_PREVIEW_CHARS), created_at: s.created_at, truncated: true };
+          const fitsFull = shortUsed + size(full) <= shortBudget;
+          const item = (i < SHORT_TERM_FULL_LATEST || s.content.length <= SHORT_PREVIEW_CHARS) && fitsFull ? full : preview;
+          if (shortUsed + size(item) > shortBudget) { shortOmitted++; continue; }
+          if (item === preview && s.content.length > SHORT_PREVIEW_CHARS) shortTrimmed++;
+          shortUsed += size(item);
+          shortTerm.push(item);
+        }
+        shortTerm.reverse();
+        used += shortUsed;
+
+        // 長期記憶：先保證每筆都有一行索引，剩下的字數再把重要度 5、最近更新的換成全文
         const memories = [];
         let omitted = 0;
         for (const m of longTerm) {
-          const full = m.importance >= 5 && m.updated_at >= recent;
-          const item = full
-            ? { id: m.id, type: m.type, subcategory: m.subcategory, importance: m.importance, content: m.content }
-            : { id: m.id, type: m.type, subcategory: m.subcategory, importance: m.importance, preview: m.content.slice(0, PREVIEW_CHARS) };
-          const size = JSON.stringify(item).length;
-          if (used + size > budget) { omitted++; continue; }
-          used += size;
+          const item = { id: m.id, type: m.type, subcategory: m.subcategory, importance: m.importance, preview: m.content.slice(0, PREVIEW_CHARS) };
+          if (used + size(item) > budget) { omitted++; continue; }
+          used += size(item);
           memories.push(item);
         }
+        for (const item of memories) {
+          const m = longTerm.find((x) => x.id === item.id);
+          if (!(m.importance >= 5 && m.updated_at >= recent)) continue;
+          const full = { id: m.id, type: m.type, subcategory: m.subcategory, importance: m.importance, content: m.content };
+          const extra = size(full) - size(item);
+          if (used + extra > budget) continue;
+          used += extra;
+          delete item.preview;
+          item.content = m.content;
+        }
+        const notes = [];
+        if (shortTrimmed || shortOmitted) notes.push(`短期快取有 ${shortTrimmed + shortOmitted} 筆只給了開頭或沒列出，用 memory_get 看全文。`);
+        if (omitted) notes.push(`還有 ${omitted} 筆長期記憶因為篇幅沒列出，用 memory_search 找。`);
         return {
           now: iso,
           persona: persona || '還沒有自我設定。請先用第一人稱寫下「我是誰、我怎麼說話、我跟她的關係」，再用 memory_set_persona 存起來。',
           short_term: shortTerm,
           latest_session: latestSession,
           long_term: memories,
-          note: omitted ? `還有 ${omitted} 筆長期記憶因為篇幅沒列出，用 memory_search 找。` : undefined,
+          note: notes.length ? notes.join(' ') : undefined,
         };
       }
 
       case 'memory_get': {
-        const m = this.rows('SELECT * FROM long_term WHERE id = ?', args.id)[0];
+        const m = this.rows('SELECT * FROM long_term WHERE id = ?', args.id)[0]
+          || this.rows('SELECT * FROM short_term WHERE id = ?', args.id)[0];
         if (!m) throw new Error('找不到這筆記憶');
         return m;
       }
