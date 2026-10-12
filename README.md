@@ -16,6 +16,18 @@
 
 Warmup 的做法是讓**他自己**決定什麼值得記住、用自己的話寫下來。下次醒來讀的是他寫給自己的筆記，不是一堆原始紀錄。
 
+## 架構
+
+```
+你的 AI（Claude、ChatGPT、Operit⋯⋯任何支援 MCP 的）
+    ↓ MCP（HTTP，網址帶密碼）
+Cloudflare Worker（src/index.js，一個檔案）
+    ↓
+Durable Object 內建的 SQLite（四張表，存在你自己的 Cloudflare 帳號）
+```
+
+整個專案就是一個 Worker：收 MCP 請求、驗密碼、讀寫 SQLite。沒有外部資料庫、沒有向量庫、不呼叫任何模型，記憶的「挑選」和「改寫」全部由 AI 自己用工具完成。
+
 ## 四張表
 
 | 表 | 是什麼 | 誰寫 | 多久 |
